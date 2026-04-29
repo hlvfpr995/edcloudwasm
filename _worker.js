@@ -4,6 +4,7 @@ const defaultUuid = ''; // 可在环境变量配置，变量名称为UUID，两�
 const defaultPassword = ''; // 可在环境变量配置，变量名称为PASSWORD，两个地方都不写为不验证密码
 const socks5AndHttpUser = ''; // 可在环境变量配置，变量名称为S5HTTPUSER，两个地方都不写为不验证密码
 const socks5AndHttpPass = ''; // 可在环境变量配置，变量名称为S5HTTPPASS，两个地方都不写为不验证密码
+const ssAeadPassword = ''; // 可在环境变量配置，变量名称为SSPASS
 // ---------------------------------------------------------------------------------
 // 理论最低带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
@@ -78,7 +79,8 @@ const getEnv = (env) => {
         uuid: (env.UUID || defaultUuid).trim(),
         password: (env.PASSWORD || defaultPassword).trim(),
         user: (env.S5HTTPUSER || socks5AndHttpUser).trim(),
-        pass: (env.S5HTTPPASS || socks5AndHttpPass).trim()
+        pass: (env.S5HTTPPASS || socks5AndHttpPass).trim(), 
+        sspass: (env.SSPASS || ssAeadPassword).trim()
     };
     return config;
 };
@@ -135,6 +137,155 @@ const binaryAddrToString = (addrType, addrBytes) => {
     let ipv6 = ((addrBytes[0] << 8) | addrBytes[1]).toString(16);
     for (let i = 1; i < 8; i++) ipv6 += ':' + ((addrBytes[i * 2] << 8) | addrBytes[i * 2 + 1]).toString(16);
     return `[${ipv6}]`;
+};
+const EMPTY_U8 = new Uint8Array(0);
+const ssSubkeyInfo = textEncoder.encode('ss-subkey');
+const incNonce = (nonce) => {
+    for (let i = 0; i < 12; i++) {
+        nonce[i] = (nonce[i] + 1) & 0xff;
+        if (nonce[i] !== 0) break;
+    }
+};
+const concatU8 = (arrs, total = 0) => {
+    if (!arrs || arrs.length === 0) return new Uint8Array(0);
+    if (arrs.length === 1) return arrs[0];
+    if (!total) for (let i = 0; i < arrs.length; i++) total += arrs[i].length;
+    const out = new Uint8Array(total);
+    for (let i = 0, o = 0; i < arrs.length; i++) {
+        out.set(arrs[i], o);
+        o += arrs[i].length;
+    }
+    return out;
+};
+const parseSsTarget = (plain) => {
+    const len = plain.length;
+    if (len < 1) return null;
+    const addrType = plain[0];
+    const addrLen = addrType === 3 ? (len > 1 ? plain[1] : null) : addrType === 1 ? 4 : addrType === 4 ? 16 : -1;
+    if (addrLen === null || !(addrLen > 0)) return null;
+    const addrOffset = addrType === 3 ? 2 : 1;
+    const dataOffset = addrOffset + addrLen + 2;
+    if (len < dataOffset) return null;
+    const portOffset = dataOffset - 2;
+    const port = (plain[portOffset] << 8) | plain[portOffset + 1];
+    return {addrType, addrBytes: plain.subarray(addrOffset, addrOffset + addrLen), dataOffset, port, isDns: port === 53};
+};
+let ssMasterKeyPromise, ssHkdfKeyPromise;
+const getSsMasterKey = () => ssMasterKeyPromise ||= (async () => {
+    const pwd = textEncoder.encode(config.sspass);
+    const out = new Uint8Array(16);
+    let prev = new Uint8Array(0), offset = 0;
+    while (offset < 16) {
+        const input = new Uint8Array(prev.length + pwd.length);
+        if (prev.length) input.set(prev, 0);
+        input.set(pwd, prev.length);
+        prev = new Uint8Array(await crypto.subtle.digest('MD5', input));
+        const copyLen = Math.min(prev.length, 16 - offset);
+        out.set(prev.subarray(0, copyLen), offset);
+        offset += copyLen;
+    }
+    return out;
+})();
+const getSsHkdfKey = () => ssHkdfKeyPromise ||= getSsMasterKey().then(masterKey => crypto.subtle.importKey('raw', masterKey, 'HKDF', false, ['deriveBits']));
+const deriveSsSubKey = async (salt) => {
+    const hkdfKey = await getSsHkdfKey();
+    const bits = await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-1', salt, info: ssSubkeyInfo}, hkdfKey, 128);
+    return new Uint8Array(bits);
+};
+const createSsAeadCtx = async (salt = crypto.getRandomValues(new Uint8Array(16))) => {
+    const subKey = await deriveSsSubKey(salt);
+    return {
+        salt,
+        key: await crypto.subtle.importKey('raw', subKey, {name: 'AES-GCM', length: 128}, false, ['encrypt', 'decrypt']),
+        nonce: new Uint8Array(12),
+        pending: EMPTY_U8,
+        lenBuf: new Uint8Array(2),
+        nextPayloadLen: -1,
+        nextNeed: 0
+    };
+};
+const appendPending = (ctx, chunk) => {
+    if (!chunk?.length) return;
+    if (!ctx.pending.length) {
+        ctx.pending = chunk;
+        return;
+    }
+    const merged = new Uint8Array(ctx.pending.length + chunk.length);
+    merged.set(ctx.pending);
+    merged.set(chunk, ctx.pending.length);
+    ctx.pending = merged;
+};
+const ssAeadDecryptFeed = async (ctx, chunk, onPlain) => {
+    appendPending(ctx, chunk);
+    const out = [];
+    let total = 0, pending = ctx.pending;
+    while (true) {
+        if (ctx.nextPayloadLen < 0) {
+            if (pending.length < 18) break;
+            let lenPlain;
+            try {
+                lenPlain = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, pending.subarray(0, 18)));
+            } catch {throw new Error('ss length decrypt failed')}
+            incNonce(ctx.nonce);
+            const payloadLen = (lenPlain[0] << 8) | lenPlain[1];
+            if (payloadLen > 0x3FFF) throw new Error('ss payload too large');
+            ctx.nextPayloadLen = payloadLen;
+            ctx.nextNeed = 18 + payloadLen + 16;
+        }
+        if (pending.length < ctx.nextNeed) break;
+        let payload;
+        try {
+            payload = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, pending.subarray(18, ctx.nextNeed)));
+        } catch {throw new Error('ss payload decrypt failed')}
+        incNonce(ctx.nonce);
+        pending = pending.subarray(ctx.nextNeed);
+        ctx.nextPayloadLen = -1;
+        ctx.nextNeed = 0;
+        if (onPlain) {
+            await onPlain(payload);
+        } else {
+            out.push(payload);
+            total += payload.length;
+        }
+    }
+    ctx.pending = pending.length ? pending : EMPTY_U8;
+    return onPlain ? EMPTY_U8 : out.length ? concatU8(out, total) : EMPTY_U8;
+};
+const ssAeadEncryptChunks = async (ctx, data) => {
+    if (!data?.length) return EMPTY_U8;
+    const out = [];
+    let total = 0;
+    for (let offset = 0; offset < data.length; offset += 0x3FFF) {
+        const p = data.subarray(offset, Math.min(offset + 0x3FFF, data.length)), l = p.length;
+        ctx.lenBuf[0] = l >> 8, ctx.lenBuf[1] = l & 0xff;
+        const lenCipher = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, ctx.lenBuf));
+        incNonce(ctx.nonce);
+        const dataCipher = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, p));
+        incNonce(ctx.nonce);
+        out.push(lenCipher, dataCipher);
+        total += lenCipher.length + dataCipher.length;
+    }
+    return concatU8(out, total);
+};
+const tryParseSsAeadInit = async (chunk) => {
+    if (chunk.length < 34) return {success: false, needMore: true};
+    try {
+        const salt = chunk.subarray(0, 16);
+        const decryptCtx = await createSsAeadCtx(salt);
+        const plain = await ssAeadDecryptFeed(decryptCtx, chunk.subarray(16));
+        if (!plain.length && (decryptCtx.pending.length || decryptCtx.nextPayloadLen >= 0)) return {success: false, needMore: true};
+        const parsedRequest = parseSsTarget(plain);
+        if (!parsedRequest) return {success: false};
+        const encryptCtx = await createSsAeadCtx();
+        return {
+            success: true,
+            isShadowsocksAead: true,
+            parsedRequest,
+            firstPayload: plain.subarray(parsedRequest.dataOffset),
+            responseSalt: encryptCtx.salt,
+            ss: {inbound: decryptCtx, outbound: encryptCtx}
+        };
+    } catch {return {success: false}}
 };
 const parseHostPort = (addr, defaultPort) => {
     let host = addr, port = defaultPort, idx;
@@ -599,14 +750,14 @@ for (let i = 0; i < 60; i++) {
     else chunkIdxLookup[i] = 12;
 }
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
-const manualPipe = async (readable, writable) => {
+const smartPipeCore = async (readable, onFlush) => {
     const safeBufferSize = bufferSize - maxChunkLen;
     let buffer = new Uint8Array(bufferSize), chunkBuf = new ArrayBuffer(maxChunkLen);
     let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null;
     let globalCount = new Float64Array(14), globalBytes = new Float64Array(14);
     let statCount = 0, totalCount = 0, totalGlobalBytes = 0;
     const flushBuffer = () => {
-        offset > 0 && (writable.send(buffer.slice(0, offset)), offset = 0);
+        offset > 0 && (onFlush(buffer.slice(0, offset)), offset = 0);
         timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
@@ -615,7 +766,9 @@ const manualPipe = async (readable, writable) => {
             const {done, value} = await reader.read(new Uint8Array(chunkBuf));
             if (done) break;
             chunkBuf = value.buffer;
-            const chunkLen = value.byteLength, idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
+            const chunkLen = value.byteLength;
+            if (!chunkLen) continue;
+            const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
             globalCount[idx]++, globalBytes[idx] += chunkLen;
             statCount++, totalCount++, totalGlobalBytes += chunkLen;
             if (statCount > 1000000) {
@@ -636,43 +789,117 @@ const manualPipe = async (readable, writable) => {
         }
     } finally {flushBuffer(), reader.releaseLock()}
 };
+const manualPipe = async (readable, writable) => await smartPipeCore(readable, raw => writable.send(raw));
+const pipeWithSsAead = async (readable, writable, ssOutCtx, salt) => {
+    let flushPromise = Promise.resolve();
+    salt?.length && (flushPromise = flushPromise.then(() => writable.send(salt)));
+    try {
+        await smartPipeCore(readable, raw => {
+            flushPromise = flushPromise.then(async () => {
+                const encrypted = await ssAeadEncryptChunks(ssOutCtx, raw);
+                encrypted.byteLength && writable.send(encrypted);
+            });
+        });
+    } finally {await flushPromise}
+};
 const handleSession = async (chunk, state, request, writable, close) => {
-    const parseLen = Math.min(chunk.length, 1024);
-    wasmMem.set(chunk.subarray(0, parseLen), dataPtr);
-    const success = parseProtocolWasm(parseLen, state.socks5State);
-    const r = wasmRes;
-    const hLen = r[12];
-    if (hLen > 0) writable.send(wasmMem.slice(dataPtr, dataPtr + hLen));
-    if (!success) {
-        const nextState = r[4];
-        if (nextState > 0) {
-            state.socks5State = nextState;
-            return;
-        }
-        return r[14] === 1 ? (state.needMore = true) : close();
-    }
     state.needMore = false;
-    const parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
-    const payload = chunk.subarray(parsedRequest.dataOffset);
+    if (!state.tcpWriter && state.initBuffer?.length) {
+        const init = state.initBuffer;
+        if (!(chunk.buffer === init.buffer && chunk.byteOffset === init.byteOffset && chunk.length >= init.length)) chunk = concatU8([init, chunk]);
+    }
+    let parsedRequest, payload, isSs = false;
+    const ssEnabled = !!config?.sspass && !state.tcpWriter && state.socks5State === 0;
+    let ssInit = null;
+    if (ssEnabled && chunk.length >= 16) {
+        ssInit = await tryParseSsAeadInit(chunk);
+        if (ssInit.success) {
+            isSs = true;
+            state.initBuffer = null;
+            parsedRequest = ssInit.parsedRequest;
+            payload = ssInit.firstPayload;
+            state.ssInbound = ssInit.ss.inbound;
+            state.ssOutbound = ssInit.ss.outbound;
+            state.ssResponseSalt = ssInit.responseSalt;
+        }
+    }
+    if (!isSs) {
+        const parseLen = Math.min(chunk.length, 1024);
+        wasmMem.set(chunk.subarray(0, parseLen), dataPtr);
+        const success = parseProtocolWasm(parseLen, state.socks5State);
+        const r = wasmRes;
+        const hLen = r[12];
+        if (hLen > 0) writable.send(wasmMem.slice(dataPtr, dataPtr + hLen));
+        if (!success) {
+            const nextState = r[4];
+            if (nextState > 0) {
+                state.initBuffer = null;
+                state.socks5State = nextState;
+                return;
+            }
+            if (r[14] === 1) {
+                state.initBuffer = chunk;
+                return state.needMore = true;
+            }
+            if (ssEnabled && (ssInit?.needMore || chunk.length < 57)) {
+                state.initBuffer = chunk;
+                return state.needMore = true;
+            }
+            state.initBuffer = null;
+            return close();
+        }
+        if (ssEnabled && r[11] === 2 && (ssInit?.needMore || chunk.length < 57)) {
+            state.initBuffer = chunk;
+            return state.needMore = true;
+        }
+        state.initBuffer = null;
+        state.socks5State = 0;
+        parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
+        payload = chunk.subarray(parsedRequest.dataOffset);
+    }
     if (parsedRequest.isDns) {
         const dnsPack = await dohDnsHandler(payload);
-        if (dnsPack?.byteLength) writable.send(dnsPack);
+        if (dnsPack?.byteLength) {
+            if (isSs || state.ssOutbound) {
+                if (state.ssResponseSalt) {
+                    writable.send(state.ssResponseSalt);
+                    state.ssResponseSalt = null;
+                }
+                const encryptedDns = await ssAeadEncryptChunks(state.ssOutbound, dnsPack);
+                if (encryptedDns.byteLength) writable.send(encryptedDns);
+            } else {
+                writable.send(dnsPack);
+            }
+        }
         return close();
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
         const tcpWriter = state.tcpSocket.writable.getWriter();
         if (payload.byteLength) await tcpWriter.write(payload);
-        state.tcpWriter = (c) => tcpWriter.write(c);
+        if (isSs || state.ssInbound) {
+            state.tcpWriter = async (c) => {
+                await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
+                    if (plain.byteLength) await tcpWriter.write(plain);
+                });
+            };
+        } else {
+            state.tcpWriter = (c) => tcpWriter.write(c);
+        }
         if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
-        manualPipe(state.tcpSocket.readable, writable).finally(() => close());
+        if (isSs || state.ssOutbound) {
+            pipeWithSsAead(state.tcpSocket.readable, writable, state.ssOutbound, state.ssResponseSalt).finally(() => close());
+            state.ssResponseSalt = null;
+        } else {
+            manualPipe(state.tcpSocket.readable, writable).finally(() => close());
+        }
     }
 };
 const handleWebSocketConn = async (webSocket, request) => {
     const protocolHeader = request.headers.get('sec-websocket-protocol');
     // @ts-ignore
     const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, initBuffer: null};
     const close = () => {state.tcpSocket?.close(), !earlyData && webSocket.close()};
     let processingChain = Promise.resolve();
     const process = async (chunk) => {
@@ -728,7 +955,7 @@ const handleGrpcPost = async (request, reader, buffer, used) => {
                             let p = grpcData[0] === 0x0A ? 1 : 0;
                             while (p && grpcData[p++] & 0x80) ;
                             const payload = p === 0 ? grpcData : grpcData.subarray(p);
-                            state.tcpWriter ? state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close);
+                            state.tcpWriter ? await state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close);
                         } else {break}
                     }
                     if (offset < bufLen) {
@@ -755,7 +982,7 @@ const handleXhttpPost = async (request, reader, xhttpBuffer, used) => {
                 while (true) {
                     if (used > 0) {
                         const payload = new Uint8Array(xhttpBuffer, 0, used);
-                        state.tcpWriter ? state.tcpWriter(payload) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
+                        state.tcpWriter ? await state.tcpWriter(payload) : (state.needMore = false, await handleSession(payload, state, request, writable, close));
                         if (!state.needMore) {
                             used = 0;
                             continue;
